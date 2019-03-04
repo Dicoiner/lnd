@@ -1,22 +1,29 @@
 package htlcswitch
 
 import (
+	"github.com/btcsuite/btcd/wire"
 	"github.com/lightningnetwork/lnd/channeldb"
-	"github.com/lightningnetwork/lnd/lnwallet"
+	"github.com/lightningnetwork/lnd/lnpeer"
+	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
 )
 
 // InvoiceDatabase is an interface which represents the persistent subsystem
 // which may search, lookup and settle invoices.
 type InvoiceDatabase interface {
-	// LookupInvoice attempts to look up an invoice according to it's 32
-	// byte payment hash.
-	LookupInvoice(chainhash.Hash) (*channeldb.Invoice, error)
+	// LookupInvoice attempts to look up an invoice according to its 32
+	// byte payment hash. This method should also reutrn the min final CLTV
+	// delta for this invoice. We'll use this to ensure that the HTLC
+	// extended to us gives us enough time to settle as we prescribe.
+	LookupInvoice(lntypes.Hash) (channeldb.Invoice, uint32, error)
 
 	// SettleInvoice attempts to mark an invoice corresponding to the
 	// passed payment hash as fully settled.
-	SettleInvoice(chainhash.Hash) error
+	SettleInvoice(payHash lntypes.Hash, paidAmount lnwire.MilliSatoshi) error
+
+	// CancelInvoice attempts to cancel the invoice corresponding to the
+	// passed payment hash.
+	CancelInvoice(payHash lntypes.Hash) error
 }
 
 // ChannelLink is an interface which represents the subsystem for managing the
@@ -30,7 +37,7 @@ type InvoiceDatabase interface {
 //       |
 //       | (Switch)		     (Switch)		       (Switch)
 //       |  Alice <-- channel link --> Bob <-- channel link --> Carol
-//	 |
+//       |
 //       | - - - - - - - - - - - - - TCP - - - - - - - - - - - - - - -
 //       |
 //       |  (Peer) 		     (Peer)	                (Peer)
@@ -38,15 +45,26 @@ type InvoiceDatabase interface {
 //       |
 //
 type ChannelLink interface {
+	// TODO(roasbeef): modify interface to embed mail boxes?
+
 	// HandleSwitchPacket handles the switch packets. This packets might be
 	// forwarded to us from another channel link in case the htlc update
 	// came from another peer or if the update was created by user
 	// initially.
-	HandleSwitchPacket(*htlcPacket)
+	//
+	// NOTE: This function MUST be non-blocking (or block as little as
+	// possible).
+	HandleSwitchPacket(*htlcPacket) error
 
 	// HandleChannelUpdate handles the htlc requests as settle/add/fail
 	// which sent to us from remote peer we have a channel with.
+	//
+	// NOTE: This function MUST be non-blocking (or block as little as
+	// possible).
 	HandleChannelUpdate(lnwire.Message)
+
+	// ChannelPoint returns the channel outpoint for the channel link.
+	ChannelPoint() *wire.OutPoint
 
 	// ChanID returns the channel ID for the channel link. The channel ID
 	// is a more compact representation of a channel's full outpoint.
@@ -57,10 +75,26 @@ type ChannelLink interface {
 	// the original funding output can be found.
 	ShortChanID() lnwire.ShortChannelID
 
+	// UpdateShortChanID updates the short channel ID for a link. This may
+	// be required in the event that a link is created before the short
+	// chan ID for it is known, or a re-org occurs, and the funding
+	// transaction changes location within the chain.
+	UpdateShortChanID() (lnwire.ShortChannelID, error)
+
 	// UpdateForwardingPolicy updates the forwarding policy for the target
 	// ChannelLink. Once updated, the link will use the new forwarding
 	// policy to govern if it an incoming HTLC should be forwarded or not.
 	UpdateForwardingPolicy(ForwardingPolicy)
+
+	// HtlcSatifiesPolicy should return a nil error if the passed HTLC
+	// details satisfy the current forwarding policy fo the target link.
+	// Otherwise, a valid protocol failure message should be returned in
+	// order to signal to the source of the HTLC, the policy consistency
+	// issue.
+	HtlcSatifiesPolicy(payHash [32]byte, incomingAmt lnwire.MilliSatoshi,
+		amtToForward lnwire.MilliSatoshi,
+		incomingTimeout, outgoingTimeout uint32,
+		heightNow uint32) lnwire.FailureMessage
 
 	// Bandwidth returns the amount of milli-satoshis which current link
 	// might pass through channel link. The value returned from this method
@@ -75,7 +109,18 @@ type ChannelLink interface {
 
 	// Peer returns the representation of remote peer with which we have
 	// the channel link opened.
-	Peer() Peer
+	Peer() lnpeer.Peer
+
+	// EligibleToForward returns a bool indicating if the channel is able
+	// to actively accept requests to forward HTLC's. A channel may be
+	// active, but not able to forward HTLC's if it hasn't yet finalized
+	// the pre-channel operation protocol with the remote peer. The switch
+	// will use this function in forwarding decisions accordingly.
+	EligibleToForward() bool
+
+	// AttachMailBox delivers an active MailBox to the link. The MailBox may
+	// have buffered messages.
+	AttachMailBox(MailBox)
 
 	// Start/Stop are used to initiate the start/stop of the channel link
 	// functioning.
@@ -83,20 +128,14 @@ type ChannelLink interface {
 	Stop()
 }
 
-// Peer is an interface which represents the remote lightning node inside our
-// system.
-type Peer interface {
-	// SendMessage sends message to remote peer.
-	SendMessage(lnwire.Message) error
-
-	// WipeChannel removes the passed channel from all indexes associated
-	// with the peer.
-	WipeChannel(*lnwallet.LightningChannel) error
-
-	// PubKey returns the serialize public key of the source peer.
-	PubKey() [33]byte
-
-	// Disconnect disconnects with peer if we have error which we can't
-	// properly handle.
-	Disconnect(reason error)
+// ForwardingLog is an interface that represents a time series database which
+// keep track of all successfully completed payment circuits. Every few
+// seconds, the switch will collate and flush out all the successful payment
+// circuits during the last interval.
+type ForwardingLog interface {
+	// AddForwardingEvents is a method that should write out the set of
+	// forwarding events in a batch to persistent storage. Outside
+	// sub-systems can then query the contents of the log for analysis,
+	// visualizations, etc.
+	AddForwardingEvents([]channeldb.ForwardingEvent) error
 }

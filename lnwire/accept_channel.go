@@ -3,12 +3,12 @@ package lnwire
 import (
 	"io"
 
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcutil"
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcutil"
 )
 
 // AcceptChannel is the message Bob sends to Alice after she initiates the
-// single funder channel workflow via a AcceptChannel message. Once Alice
+// single funder channel workflow via an AcceptChannel message. Once Alice
 // receives Bob's response, then she has all the items necessary to construct
 // the funding transaction, and both commitment transactions.
 type AcceptChannel struct {
@@ -75,6 +75,12 @@ type AcceptChannel struct {
 	// where they claim funds.
 	DelayedPaymentPoint *btcec.PublicKey
 
+	// HtlcPoint is the base point used to derive the set of keys for this
+	// party that will be used within the HTLC public key scripts.  This
+	// value is combined with the receiver's revocation base point in order
+	// to derive the keys that are used within HTLC scripts.
+	HtlcPoint *btcec.PublicKey
+
 	// FirstCommitmentPoint is the first commitment point for the sending
 	// party. This value should be combined with the receiver's revocation
 	// base point in order to derive the revocation keys that are placed
@@ -92,7 +98,7 @@ var _ Message = (*AcceptChannel)(nil)
 //
 // This is part of the lnwire.Message interface.
 func (a *AcceptChannel) Encode(w io.Writer, pver uint32) error {
-	return writeElements(w,
+	return WriteElements(w,
 		a.PendingChannelID[:],
 		a.DustLimit,
 		a.MaxValueInFlight,
@@ -105,6 +111,7 @@ func (a *AcceptChannel) Encode(w io.Writer, pver uint32) error {
 		a.RevocationPoint,
 		a.PaymentPoint,
 		a.DelayedPaymentPoint,
+		a.HtlcPoint,
 		a.FirstCommitmentPoint,
 	)
 }
@@ -115,7 +122,7 @@ func (a *AcceptChannel) Encode(w io.Writer, pver uint32) error {
 //
 // This is part of the lnwire.Message interface.
 func (a *AcceptChannel) Decode(r io.Reader, pver uint32) error {
-	return readElements(r,
+	return ReadElements(r,
 		a.PendingChannelID[:],
 		&a.DustLimit,
 		&a.MaxValueInFlight,
@@ -128,12 +135,13 @@ func (a *AcceptChannel) Decode(r io.Reader, pver uint32) error {
 		&a.RevocationPoint,
 		&a.PaymentPoint,
 		&a.DelayedPaymentPoint,
+		&a.HtlcPoint,
 		&a.FirstCommitmentPoint,
 	)
 }
 
 // MsgType returns the MessageType code which uniquely identifies this message
-// as a AcceptChannel on the wire.
+// as an AcceptChannel on the wire.
 //
 // This is part of the lnwire.Message interface.
 func (a *AcceptChannel) MsgType() MessageType {
@@ -145,6 +153,6 @@ func (a *AcceptChannel) MsgType() MessageType {
 //
 // This is part of the lnwire.Message interface.
 func (a *AcceptChannel) MaxPayloadLength(uint32) uint32 {
-	// 32 + (8 * 4) + (4 * 1) + (2 * 2) + (33 * 5)
-	return 237
+	// 32 + (8 * 4) + (4 * 1) + (2 * 2) + (33 * 6)
+	return 270
 }

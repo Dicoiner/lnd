@@ -8,11 +8,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
 
-	"github.com/roasbeef/btcd/btcec"
+	"github.com/btcsuite/btcd/btcec"
 )
 
 const (
@@ -33,6 +34,12 @@ const (
 	// keyRotationInterval is the number of messages sent on a single
 	// cipher stream before the keys are rotated forwards.
 	keyRotationInterval = 1000
+
+	// handshakeReadTimeout is a read timeout that will be enforced when
+	// waiting for data payloads during the various acts of Brontide. If
+	// the remote party fails to deliver the proper payload within this
+	// time frame, then we'll fail the connection.
+	handshakeReadTimeout = time.Second * 5
 )
 
 var (
@@ -40,6 +47,16 @@ var (
 	// the cipher session exceeds the maximum allowed message payload.
 	ErrMaxMessageLengthExceeded = errors.New("the generated payload exceeds " +
 		"the max allowed message length of (2^16)-1")
+
+	// lightningPrologue is the noise prologue that is used to initialize
+	// the brontide noise handshake.
+	lightningPrologue = []byte("lightning")
+
+	// ephemeralGen is the default ephemeral key generator, used to derive a
+	// unique ephemeral key for each brontide handshake.
+	ephemeralGen = func() (*btcec.PrivateKey, error) {
+		return btcec.NewPrivateKey(btcec.S256())
+	}
 )
 
 // TODO(roasbeef): free buffer pool?
@@ -345,26 +362,29 @@ type Machine struct {
 	ephemeralGen func() (*btcec.PrivateKey, error)
 
 	handshakeState
+
+	// nextCipherHeader is a static buffer that we'll use to read in the
+	// next ciphertext header from the wire. The header is a 2 byte length
+	// (of the next ciphertext), followed by a 16 byte MAC.
+	nextCipherHeader [lengthHeaderSize + macSize]byte
 }
 
 // NewBrontideMachine creates a new instance of the brontide state-machine. If
 // the responder (listener) is creating the object, then the remotePub should
 // be nil. The handshake state within brontide is initialized using the ascii
-// string "bitcoin" as the prologue. The last parameter is a set of variadic
+// string "lightning" as the prologue. The last parameter is a set of variadic
 // arguments for adding additional options to the brontide Machine
 // initialization.
 func NewBrontideMachine(initiator bool, localPub *btcec.PrivateKey,
 	remotePub *btcec.PublicKey, options ...func(*Machine)) *Machine {
 
-	handshake := newHandshakeState(initiator, []byte("lightning"), localPub,
-		remotePub)
+	handshake := newHandshakeState(
+		initiator, lightningPrologue, localPub, remotePub,
+	)
 
-	m := &Machine{handshakeState: handshake}
-
-	// With the initial base machine created, we'll assign our default
-	// version of the ephemeral key generator.
-	m.ephemeralGen = func() (*btcec.PrivateKey, error) {
-		return btcec.NewPrivateKey(btcec.S256())
+	m := &Machine{
+		handshakeState: handshake,
+		ephemeralGen:   ephemeralGen,
 	}
 
 	// With the default options established, we'll now process all the
@@ -443,7 +463,7 @@ func (b *Machine) GenActOne() ([ActOneSize]byte, error) {
 
 // RecvActOne processes the act one packet sent by the initiator. The responder
 // executes the mirrored actions to that of the initiator extending the
-// handshake digest and deriving a new shared secret based on a ECDH with the
+// handshake digest and deriving a new shared secret based on an ECDH with the
 // initiator's ephemeral key and responder's static key.
 func (b *Machine) RecvActOne(actOne [ActOneSize]byte) error {
 	var (
@@ -627,7 +647,7 @@ func (b *Machine) RecvActThree(actThree [ActThreeSize]byte) error {
 }
 
 // split is the final wrap-up act to be executed at the end of a successful
-// three act handshake. This function creates to internal cipherState
+// three act handshake. This function creates two internal cipherState
 // instances: one which is used to encrypt messages from the initiator to the
 // responder, and another which is used to encrypt message for the opposite
 // direction.
@@ -663,7 +683,7 @@ func (b *Machine) split() {
 }
 
 // WriteMessage writes the next message p to the passed io.Writer. The
-// ciphertext of the message is pre-pended with an encrypt+auth'd length which
+// ciphertext of the message is prepended with an encrypt+auth'd length which
 // must be used as the AD to the AEAD construction when being decrypted by the
 // other side.
 func (b *Machine) WriteMessage(w io.Writer, p []byte) error {
@@ -698,25 +718,59 @@ func (b *Machine) WriteMessage(w io.Writer, p []byte) error {
 // ReadMessage attempts to read the next message from the passed io.Reader. In
 // the case of an authentication error, a non-nil error is returned.
 func (b *Machine) ReadMessage(r io.Reader) ([]byte, error) {
-	var cipherLen [lengthHeaderSize + macSize]byte
-	if _, err := io.ReadFull(r, cipherLen[:]); err != nil {
-		return nil, err
-	}
-
-	// Attempt to decrypt+auth the packet length present in the stream.
-	pktLenBytes, err := b.recvCipher.Decrypt(nil, nil, cipherLen[:])
+	pktLen, err := b.ReadHeader(r)
 	if err != nil {
 		return nil, err
 	}
 
-	// Next, using the length read from the packet header, read the
-	// encrypted packet itself.
-	var cipherText [math.MaxUint16 + macSize]byte
+	buf := make([]byte, pktLen)
+	return b.ReadBody(r, buf)
+}
+
+// ReadHeader attempts to read the next message header from the passed
+// io.Reader. The header contains the length of the next body including
+// additional overhead of the MAC. In the case of an authentication error, a
+// non-nil error is returned.
+//
+// NOTE: This method SHOULD NOT be used in the case that the io.Reader may be
+// adversarial and induce long delays. If the caller needs to set read deadlines
+// appropriately, it is preferred that they use the split ReadHeader and
+// ReadBody methods so that the deadlines can be set appropriately on each.
+func (b *Machine) ReadHeader(r io.Reader) (uint32, error) {
+	_, err := io.ReadFull(r, b.nextCipherHeader[:])
+	if err != nil {
+		return 0, err
+	}
+
+	// Attempt to decrypt+auth the packet length present in the stream.
+	pktLenBytes, err := b.recvCipher.Decrypt(
+		nil, nil, b.nextCipherHeader[:],
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	// Compute the packet length that we will need to read off the wire.
 	pktLen := uint32(binary.BigEndian.Uint16(pktLenBytes)) + macSize
-	if _, err := io.ReadFull(r, cipherText[:pktLen]); err != nil {
+
+	return pktLen, nil
+}
+
+// ReadBody attempts to ready the next message body from the passed io.Reader.
+// The provided buffer MUST be the length indicated by the packet length
+// returned by the preceding call to ReadHeader. In the case of an
+// authentication eerror, a non-nil error is returned.
+func (b *Machine) ReadBody(r io.Reader, buf []byte) ([]byte, error) {
+	// Next, using the length read from the packet header, read the
+	// encrypted packet itself into the buffer allocated by the read
+	// pool.
+	_, err := io.ReadFull(r, buf)
+	if err != nil {
 		return nil, err
 	}
 
+	// Finally, decrypt the message held in the buffer, and return a
+	// new byte slice containing the plaintext.
 	// TODO(roasbeef): modify to let pass in slice
-	return b.recvCipher.Decrypt(nil, nil, cipherText[:pktLen])
+	return b.recvCipher.Decrypt(nil, nil, buf)
 }

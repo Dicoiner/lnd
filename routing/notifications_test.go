@@ -10,15 +10,16 @@ import (
 
 	prand "math/rand"
 
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/chainview"
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
 )
 
 var (
@@ -34,6 +35,8 @@ var (
 		0x4f, 0x2f, 0x6f, 0x25, 0x88, 0xa3, 0xef, 0xb9,
 		0x6a, 0x49, 0x18, 0x83, 0x31, 0x98, 0x47, 0x53,
 	}
+
+	testTime = time.Date(2018, time.January, 9, 14, 00, 00, 0, time.UTC)
 
 	priv1, _    = btcec.NewPrivateKey(btcec.S256())
 	bitcoinKey1 = priv1.PubKey()
@@ -51,30 +54,33 @@ func createTestNode() (*channeldb.LightningNode, error) {
 	}
 
 	pub := priv.PubKey().SerializeCompressed()
-	return &channeldb.LightningNode{
+	n := &channeldb.LightningNode{
 		HaveNodeAnnouncement: true,
 		LastUpdate:           time.Unix(updateTime, 0),
 		Addresses:            testAddrs,
-		PubKey:               priv.PubKey(),
 		Color:                color.RGBA{1, 2, 3, 0},
 		Alias:                "kek" + string(pub[:]),
-		AuthSig:              testSig,
+		AuthSigBytes:         testSig.Serialize(),
 		Features:             testFeatures,
-	}, nil
+	}
+	copy(n.PubKeyBytes[:], pub)
+
+	return n, nil
 }
 
 func randEdgePolicy(chanID *lnwire.ShortChannelID,
 	node *channeldb.LightningNode) *channeldb.ChannelEdgePolicy {
 
 	return &channeldb.ChannelEdgePolicy{
-		Signature:                 testSig,
+		SigBytes:                  testSig.Serialize(),
 		ChannelID:                 chanID.ToUint64(),
 		LastUpdate:                time.Unix(int64(prand.Int31()), 0),
 		TimeLockDelta:             uint16(prand.Int63()),
 		MinHTLC:                   lnwire.MilliSatoshi(prand.Int31()),
+		MaxHTLC:                   lnwire.MilliSatoshi(prand.Int31()),
 		FeeBaseMSat:               lnwire.MilliSatoshi(prand.Int31()),
 		FeeProportionalMillionths: lnwire.MilliSatoshi(prand.Int31()),
-		Node: node,
+		Node:                      node,
 	}
 }
 
@@ -83,7 +89,7 @@ func createChannelEdge(ctx *testCtx, bitcoinKey1, bitcoinKey2 []byte,
 	*lnwire.ShortChannelID, error) {
 
 	fundingTx := wire.NewMsgTx(2)
-	_, tx, err := lnwallet.GenFundingPkScript(
+	_, tx, err := input.GenFundingPkScript(
 		bitcoinKey1,
 		bitcoinKey2,
 		int64(chanValue),
@@ -147,7 +153,9 @@ func (m *mockChain) GetBestBlock() (*chainhash.Hash, int32, error) {
 	m.RLock()
 	defer m.RUnlock()
 
-	return nil, m.bestHeight, nil
+	blockHash := m.blockIndex[uint32(m.bestHeight)]
+
+	return &blockHash, m.bestHeight, nil
 }
 
 func (m *mockChain) GetTransaction(txid *chainhash.Hash) (*wire.MsgTx, error) {
@@ -162,7 +170,6 @@ func (m *mockChain) GetBlockHash(blockHeight int64) (*chainhash.Hash, error) {
 	if !ok {
 		return nil, fmt.Errorf("can't find block hash, for "+
 			"height %v", blockHeight)
-
 	}
 
 	return &hash, nil
@@ -173,7 +180,7 @@ func (m *mockChain) addUtxo(op wire.OutPoint, out *wire.TxOut) {
 	m.utxos[op] = *out
 	m.Unlock()
 }
-func (m *mockChain) GetUtxo(op *wire.OutPoint, _ uint32) (*wire.TxOut, error) {
+func (m *mockChain) GetUtxo(op *wire.OutPoint, _ []byte, _ uint32) (*wire.TxOut, error) {
 	m.RLock()
 	defer m.RUnlock()
 
@@ -185,9 +192,9 @@ func (m *mockChain) GetUtxo(op *wire.OutPoint, _ uint32) (*wire.TxOut, error) {
 	return &utxo, nil
 }
 
-func (m *mockChain) addBlock(block *wire.MsgBlock, height uint32) {
+func (m *mockChain) addBlock(block *wire.MsgBlock, height uint32, nonce uint32) {
 	m.Lock()
-	block.Header.Nonce = height
+	block.Header.Nonce = nonce
 	hash := block.Header.BlockHash()
 	m.blocks[hash] = block
 	m.blockIndex[height] = hash
@@ -211,27 +218,40 @@ type mockChainView struct {
 	newBlocks   chan *chainview.FilteredBlock
 	staleBlocks chan *chainview.FilteredBlock
 
+	chain lnwallet.BlockChainIO
+
 	filter map[wire.OutPoint]struct{}
+
+	quit chan struct{}
 }
 
 // A compile time check to ensure mockChainView implements the
 // chainview.FilteredChainView.
 var _ chainview.FilteredChainView = (*mockChainView)(nil)
 
-func newMockChainView() *mockChainView {
+func newMockChainView(chain lnwallet.BlockChainIO) *mockChainView {
 	return &mockChainView{
+		chain:       chain,
 		newBlocks:   make(chan *chainview.FilteredBlock, 10),
 		staleBlocks: make(chan *chainview.FilteredBlock, 10),
 		filter:      make(map[wire.OutPoint]struct{}),
+		quit:        make(chan struct{}),
 	}
 }
 
-func (m *mockChainView) UpdateFilter(ops []wire.OutPoint, updateHeight uint32) error {
+func (m *mockChainView) Reset() {
+	m.filter = make(map[wire.OutPoint]struct{})
+	m.quit = make(chan struct{})
+	m.newBlocks = make(chan *chainview.FilteredBlock, 10)
+	m.staleBlocks = make(chan *chainview.FilteredBlock, 10)
+}
+
+func (m *mockChainView) UpdateFilter(ops []channeldb.EdgePoint, updateHeight uint32) error {
 	m.Lock()
 	defer m.Unlock()
 
 	for _, op := range ops {
-		m.filter[op] = struct{}{}
+		m.filter[op.OutPoint] = struct{}{}
 	}
 
 	return nil
@@ -243,10 +263,31 @@ func (m *mockChainView) notifyBlock(hash chainhash.Hash, height uint32,
 	m.RLock()
 	defer m.RUnlock()
 
-	m.newBlocks <- &chainview.FilteredBlock{
+	select {
+	case m.newBlocks <- &chainview.FilteredBlock{
 		Hash:         hash,
 		Height:       height,
 		Transactions: txns,
+	}:
+	case <-m.quit:
+		return
+	}
+}
+
+func (m *mockChainView) notifyStaleBlock(hash chainhash.Hash, height uint32,
+	txns []*wire.MsgTx) {
+
+	m.RLock()
+	defer m.RUnlock()
+
+	select {
+	case m.staleBlocks <- &chainview.FilteredBlock{
+		Hash:         hash,
+		Height:       height,
+		Transactions: txns,
+	}:
+	case <-m.quit:
+		return
 	}
 }
 
@@ -259,7 +300,31 @@ func (m *mockChainView) DisconnectedBlocks() <-chan *chainview.FilteredBlock {
 }
 
 func (m *mockChainView) FilterBlock(blockHash *chainhash.Hash) (*chainview.FilteredBlock, error) {
-	return nil, nil
+
+	block, err := m.chain.GetBlock(blockHash)
+	if err != nil {
+		return nil, err
+	}
+
+	filteredBlock := &chainview.FilteredBlock{}
+	for _, tx := range block.Transactions {
+		for _, txIn := range tx.TxIn {
+			prevOp := txIn.PreviousOutPoint
+			if _, ok := m.filter[prevOp]; ok {
+				filteredBlock.Transactions = append(
+					filteredBlock.Transactions, tx,
+				)
+
+				m.Lock()
+				delete(m.filter, prevOp)
+				m.Unlock()
+
+				break
+			}
+		}
+	}
+
+	return filteredBlock, nil
 }
 
 func (m *mockChainView) Start() error {
@@ -267,6 +332,7 @@ func (m *mockChainView) Start() error {
 }
 
 func (m *mockChainView) Stop() error {
+	close(m.quit)
 	return nil
 }
 
@@ -275,7 +341,7 @@ func (m *mockChainView) Stop() error {
 func TestEdgeUpdateNotification(t *testing.T) {
 	t.Parallel()
 
-	ctx, cleanUp, err := createTestCtx(0)
+	ctx, cleanUp, err := createTestCtxSingleNode(0)
 	defer cleanUp()
 	if err != nil {
 		t.Fatalf("unable to create router: %v", err)
@@ -287,7 +353,7 @@ func TestEdgeUpdateNotification(t *testing.T) {
 		bitcoinKey1.SerializeCompressed(), bitcoinKey2.SerializeCompressed(),
 		chanValue, 0)
 	if err != nil {
-		t.Fatalf("unbale create channel edge: %v", err)
+		t.Fatalf("unable create channel edge: %v", err)
 	}
 
 	// We'll also add a record for the block that included our funding
@@ -295,7 +361,7 @@ func TestEdgeUpdateNotification(t *testing.T) {
 	fundingBlock := &wire.MsgBlock{
 		Transactions: []*wire.MsgTx{fundingTx},
 	}
-	ctx.chain.addBlock(fundingBlock, chanID.BlockHeight)
+	ctx.chain.addBlock(fundingBlock, chanID.BlockHeight, chanID.BlockHeight)
 
 	// Next we'll create two test nodes that the fake channel will be open
 	// between.
@@ -311,18 +377,18 @@ func TestEdgeUpdateNotification(t *testing.T) {
 	// Finally, to conclude our test set up, we'll create a channel
 	// update to announce the created channel between the two nodes.
 	edge := &channeldb.ChannelEdgeInfo{
-		ChannelID:   chanID.ToUint64(),
-		NodeKey1:    node1.PubKey,
-		NodeKey2:    node2.PubKey,
-		BitcoinKey1: bitcoinKey1,
-		BitcoinKey2: bitcoinKey2,
+		ChannelID:     chanID.ToUint64(),
+		NodeKey1Bytes: node1.PubKeyBytes,
+		NodeKey2Bytes: node2.PubKeyBytes,
 		AuthProof: &channeldb.ChannelAuthProof{
-			NodeSig1:    testSig,
-			NodeSig2:    testSig,
-			BitcoinSig1: testSig,
-			BitcoinSig2: testSig,
+			NodeSig1Bytes:    testSig.Serialize(),
+			NodeSig2Bytes:    testSig.Serialize(),
+			BitcoinSig1Bytes: testSig.Serialize(),
+			BitcoinSig2Bytes: testSig.Serialize(),
 		},
 	}
+	copy(edge.BitcoinKey1Bytes[:], bitcoinKey1.SerializeCompressed())
+	copy(edge.BitcoinKey2Bytes[:], bitcoinKey2.SerializeCompressed())
 
 	if err := ctx.router.AddEdge(edge); err != nil {
 		t.Fatalf("unable to add edge: %v", err)
@@ -338,9 +404,9 @@ func TestEdgeUpdateNotification(t *testing.T) {
 	// Create random policy edges that are stemmed to the channel id
 	// created above.
 	edge1 := randEdgePolicy(chanID, node1)
-	edge1.Flags = 0
+	edge1.ChannelFlags = 0
 	edge2 := randEdgePolicy(chanID, node2)
-	edge2.Flags = 1
+	edge2.ChannelFlags = 1
 
 	if err := ctx.router.UpdateEdge(edge1); err != nil {
 		t.Fatalf("unable to add edge update: %v", err)
@@ -370,6 +436,11 @@ func TestEdgeUpdateNotification(t *testing.T) {
 				"expected %v, got %v", edgeAnn.MinHTLC,
 				edgeUpdate.MinHTLC)
 		}
+		if edgeUpdate.MaxHTLC != edgeAnn.MaxHTLC {
+			t.Fatalf("max HTLC of edge doesn't match: "+
+				"expected %v, got %v", edgeAnn.MaxHTLC,
+				edgeUpdate.MaxHTLC)
+		}
 		if edgeUpdate.BaseFee != edgeAnn.FeeBaseMSat {
 			t.Fatalf("base fee of edge doesn't match: "+
 				"expected %v, got %v", edgeAnn.FeeBaseMSat,
@@ -389,9 +460,18 @@ func TestEdgeUpdateNotification(t *testing.T) {
 
 	// Create lookup map for notifications we are intending to receive. Entries
 	// are removed from the map when the anticipated notification is received.
-	var waitingFor = map[vertex]int{
-		newVertex(node1.PubKey): 1,
-		newVertex(node2.PubKey): 2,
+	var waitingFor = map[Vertex]int{
+		Vertex(node1.PubKeyBytes): 1,
+		Vertex(node2.PubKeyBytes): 2,
+	}
+
+	node1Pub, err := node1.PubKey()
+	if err != nil {
+		t.Fatalf("unable to encode key: %v", err)
+	}
+	node2Pub, err := node2.PubKey()
+	if err != nil {
+		t.Fatalf("unable to encode key: %v", err)
 	}
 
 	const numEdgePolicies = 2
@@ -406,27 +486,27 @@ func TestEdgeUpdateNotification(t *testing.T) {
 			}
 
 			edgeUpdate := ntfn.ChannelEdgeUpdates[0]
-			nodeVertex := newVertex(edgeUpdate.AdvertisingNode)
+			nodeVertex := NewVertex(edgeUpdate.AdvertisingNode)
 
 			if idx, ok := waitingFor[nodeVertex]; ok {
 				switch idx {
 				case 1:
 					// Received notification corresponding to edge1.
 					assertEdgeCorrect(t, edgeUpdate, edge1)
-					if !edgeUpdate.AdvertisingNode.IsEqual(node1.PubKey) {
+					if !edgeUpdate.AdvertisingNode.IsEqual(node1Pub) {
 						t.Fatal("advertising node mismatch")
 					}
-					if !edgeUpdate.ConnectingNode.IsEqual(node2.PubKey) {
+					if !edgeUpdate.ConnectingNode.IsEqual(node2Pub) {
 						t.Fatal("connecting node mismatch")
 					}
 
 				case 2:
 					// Received notification corresponding to edge2.
 					assertEdgeCorrect(t, edgeUpdate, edge2)
-					if !edgeUpdate.AdvertisingNode.IsEqual(node2.PubKey) {
+					if !edgeUpdate.AdvertisingNode.IsEqual(node2Pub) {
 						t.Fatal("advertising node mismatch")
 					}
-					if !edgeUpdate.ConnectingNode.IsEqual(node1.PubKey) {
+					if !edgeUpdate.ConnectingNode.IsEqual(node1Pub) {
 						t.Fatal("connecting node mismatch")
 					}
 
@@ -434,8 +514,8 @@ func TestEdgeUpdateNotification(t *testing.T) {
 					t.Fatal("invalid edge index")
 				}
 
-				// Remove entry from waitingFor map to ensure we don't double count a
-				// repeat notification.
+				// Remove entry from waitingFor map to ensure
+				// we don't double count a repeat notification.
 				delete(waitingFor, nodeVertex)
 
 			} else {
@@ -455,7 +535,7 @@ func TestNodeUpdateNotification(t *testing.T) {
 	t.Parallel()
 
 	const startingBlockHeight = 101
-	ctx, cleanUp, err := createTestCtx(startingBlockHeight)
+	ctx, cleanUp, err := createTestCtxSingleNode(startingBlockHeight)
 	defer cleanUp()
 	if err != nil {
 		t.Fatalf("unable to create router: %v", err)
@@ -477,7 +557,7 @@ func TestNodeUpdateNotification(t *testing.T) {
 	fundingBlock := &wire.MsgBlock{
 		Transactions: []*wire.MsgTx{fundingTx},
 	}
-	ctx.chain.addBlock(fundingBlock, chanID.BlockHeight)
+	ctx.chain.addBlock(fundingBlock, chanID.BlockHeight, chanID.BlockHeight)
 
 	// Create two nodes acting as endpoints in the created channel, and use
 	// them to trigger notifications by sending updated node announcement
@@ -492,18 +572,18 @@ func TestNodeUpdateNotification(t *testing.T) {
 	}
 
 	edge := &channeldb.ChannelEdgeInfo{
-		ChannelID:   chanID.ToUint64(),
-		NodeKey1:    node1.PubKey,
-		NodeKey2:    node2.PubKey,
-		BitcoinKey1: bitcoinKey1,
-		BitcoinKey2: bitcoinKey2,
+		ChannelID:     chanID.ToUint64(),
+		NodeKey1Bytes: node1.PubKeyBytes,
+		NodeKey2Bytes: node2.PubKeyBytes,
 		AuthProof: &channeldb.ChannelAuthProof{
-			NodeSig1:    testSig,
-			NodeSig2:    testSig,
-			BitcoinSig1: testSig,
-			BitcoinSig2: testSig,
+			NodeSig1Bytes:    testSig.Serialize(),
+			NodeSig2Bytes:    testSig.Serialize(),
+			BitcoinSig1Bytes: testSig.Serialize(),
+			BitcoinSig2Bytes: testSig.Serialize(),
 		},
 	}
+	copy(edge.BitcoinKey1Bytes[:], bitcoinKey1.SerializeCompressed())
+	copy(edge.BitcoinKey2Bytes[:], bitcoinKey2.SerializeCompressed())
 
 	// Adding the edge will add the nodes to the graph, but with no info
 	// except the pubkey known.
@@ -529,15 +609,17 @@ func TestNodeUpdateNotification(t *testing.T) {
 	assertNodeNtfnCorrect := func(t *testing.T, ann *channeldb.LightningNode,
 		nodeUpdate *NetworkNodeUpdate) {
 
+		nodeKey, _ := ann.PubKey()
+
 		// The notification received should directly map the
 		// announcement originally sent.
 		if nodeUpdate.Addresses[0] != ann.Addresses[0] {
 			t.Fatalf("node address doesn't match: expected %v, got %v",
 				nodeUpdate.Addresses[0], ann.Addresses[0])
 		}
-		if !nodeUpdate.IdentityKey.IsEqual(ann.PubKey) {
+		if !nodeUpdate.IdentityKey.IsEqual(nodeKey) {
 			t.Fatalf("node identity keys don't match: expected %x, "+
-				"got %x", ann.PubKey.SerializeCompressed(),
+				"got %x", nodeKey.SerializeCompressed(),
 				nodeUpdate.IdentityKey.SerializeCompressed())
 		}
 		if nodeUpdate.Alias != ann.Alias {
@@ -548,9 +630,9 @@ func TestNodeUpdateNotification(t *testing.T) {
 
 	// Create lookup map for notifications we are intending to receive. Entries
 	// are removed from the map when the anticipated notification is received.
-	var waitingFor = map[vertex]int{
-		newVertex(node1.PubKey): 1,
-		newVertex(node2.PubKey): 2,
+	var waitingFor = map[Vertex]int{
+		Vertex(node1.PubKeyBytes): 1,
+		Vertex(node2.PubKeyBytes): 2,
 	}
 
 	// Exactly two notifications should be sent, each corresponding to the
@@ -567,7 +649,7 @@ func TestNodeUpdateNotification(t *testing.T) {
 			}
 
 			nodeUpdate := ntfn.NodeUpdates[0]
-			nodeVertex := newVertex(nodeUpdate.IdentityKey)
+			nodeVertex := NewVertex(nodeUpdate.IdentityKey)
 			if idx, ok := waitingFor[nodeVertex]; ok {
 				switch idx {
 				case 1:
@@ -631,7 +713,7 @@ func TestNotificationCancellation(t *testing.T) {
 	t.Parallel()
 
 	const startingBlockHeight = 101
-	ctx, cleanUp, err := createTestCtx(startingBlockHeight)
+	ctx, cleanUp, err := createTestCtxSingleNode(startingBlockHeight)
 	defer cleanUp()
 	if err != nil {
 		t.Fatalf("unable to create router: %v", err)
@@ -658,7 +740,7 @@ func TestNotificationCancellation(t *testing.T) {
 	fundingBlock := &wire.MsgBlock{
 		Transactions: []*wire.MsgTx{fundingTx},
 	}
-	ctx.chain.addBlock(fundingBlock, chanID.BlockHeight)
+	ctx.chain.addBlock(fundingBlock, chanID.BlockHeight, chanID.BlockHeight)
 
 	// We'll create a fresh new node topology update to feed to the channel
 	// router.
@@ -678,18 +760,18 @@ func TestNotificationCancellation(t *testing.T) {
 	ntfnClient.Cancel()
 
 	edge := &channeldb.ChannelEdgeInfo{
-		ChannelID:   chanID.ToUint64(),
-		NodeKey1:    node1.PubKey,
-		NodeKey2:    node2.PubKey,
-		BitcoinKey1: bitcoinKey1,
-		BitcoinKey2: bitcoinKey2,
+		ChannelID:     chanID.ToUint64(),
+		NodeKey1Bytes: node1.PubKeyBytes,
+		NodeKey2Bytes: node2.PubKeyBytes,
 		AuthProof: &channeldb.ChannelAuthProof{
-			NodeSig1:    testSig,
-			NodeSig2:    testSig,
-			BitcoinSig1: testSig,
-			BitcoinSig2: testSig,
+			NodeSig1Bytes:    testSig.Serialize(),
+			NodeSig2Bytes:    testSig.Serialize(),
+			BitcoinSig1Bytes: testSig.Serialize(),
+			BitcoinSig2Bytes: testSig.Serialize(),
 		},
 	}
+	copy(edge.BitcoinKey1Bytes[:], bitcoinKey1.SerializeCompressed())
+	copy(edge.BitcoinKey2Bytes[:], bitcoinKey2.SerializeCompressed())
 	if err := ctx.router.AddEdge(edge); err != nil {
 		t.Fatalf("unable to add edge: %v", err)
 	}
@@ -723,7 +805,7 @@ func TestChannelCloseNotification(t *testing.T) {
 	t.Parallel()
 
 	const startingBlockHeight = 101
-	ctx, cleanUp, err := createTestCtx(startingBlockHeight)
+	ctx, cleanUp, err := createTestCtxSingleNode(startingBlockHeight)
 	defer cleanUp()
 	if err != nil {
 		t.Fatalf("unable to create router: %v", err)
@@ -743,7 +825,7 @@ func TestChannelCloseNotification(t *testing.T) {
 	fundingBlock := &wire.MsgBlock{
 		Transactions: []*wire.MsgTx{fundingTx},
 	}
-	ctx.chain.addBlock(fundingBlock, chanID.BlockHeight)
+	ctx.chain.addBlock(fundingBlock, chanID.BlockHeight, chanID.BlockHeight)
 
 	// Next we'll create two test nodes that the fake channel will be open
 	// between.
@@ -759,18 +841,18 @@ func TestChannelCloseNotification(t *testing.T) {
 	// Finally, to conclude our test set up, we'll create a channel
 	// announcement to announce the created channel between the two nodes.
 	edge := &channeldb.ChannelEdgeInfo{
-		ChannelID:   chanID.ToUint64(),
-		NodeKey1:    node1.PubKey,
-		NodeKey2:    node2.PubKey,
-		BitcoinKey1: bitcoinKey1,
-		BitcoinKey2: bitcoinKey2,
+		ChannelID:     chanID.ToUint64(),
+		NodeKey1Bytes: node1.PubKeyBytes,
+		NodeKey2Bytes: node2.PubKeyBytes,
 		AuthProof: &channeldb.ChannelAuthProof{
-			NodeSig1:    testSig,
-			NodeSig2:    testSig,
-			BitcoinSig1: testSig,
-			BitcoinSig2: testSig,
+			NodeSig1Bytes:    testSig.Serialize(),
+			NodeSig2Bytes:    testSig.Serialize(),
+			BitcoinSig1Bytes: testSig.Serialize(),
+			BitcoinSig2Bytes: testSig.Serialize(),
 		},
 	}
+	copy(edge.BitcoinKey1Bytes[:], bitcoinKey1.SerializeCompressed())
+	copy(edge.BitcoinKey2Bytes[:], bitcoinKey2.SerializeCompressed())
 	if err := ctx.router.AddEdge(edge); err != nil {
 		t.Fatalf("unable to add edge: %v", err)
 	}
@@ -797,7 +879,7 @@ func TestChannelCloseNotification(t *testing.T) {
 			},
 		},
 	}
-	ctx.chain.addBlock(newBlock, blockHeight)
+	ctx.chain.addBlock(newBlock, blockHeight, blockHeight)
 	ctx.chainView.notifyBlock(newBlock.Header.BlockHash(), blockHeight,
 		newBlock.Transactions)
 
@@ -811,7 +893,7 @@ func TestChannelCloseNotification(t *testing.T) {
 		if len(closedChans) == 0 {
 			t.Fatal("close channel ntfn not populated")
 		} else if len(closedChans) != 1 {
-			t.Fatalf("only one should've been detected as closed, "+
+			t.Fatalf("only one should have been detected as closed, "+
 				"instead %v were", len(closedChans))
 		}
 

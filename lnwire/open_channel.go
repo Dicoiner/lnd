@@ -3,9 +3,20 @@ package lnwire
 import (
 	"io"
 
-	"github.com/roasbeef/btcd/btcec"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcutil"
+	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcutil"
+)
+
+// FundingFlag represents the possible bit mask values for the ChannelFlags
+// field within the OpenChannel struct.
+type FundingFlag uint8
+
+const (
+	// FFAnnounceChannel is a FundingFlag that when set, indicates the
+	// initiator of a funding flow wishes to announce the channel to the
+	// greater network.
+	FFAnnounceChannel FundingFlag = 1 << iota
 )
 
 // OpenChannel is the message Alice sends to Bob if we should like to create a
@@ -57,6 +68,9 @@ type OpenChannel struct {
 	// FeePerKiloWeight is the initial fee rate that the initiator suggests
 	// for both commitment transaction. This value is expressed in sat per
 	// kilo-weight.
+	//
+	// TODO(halseth): make SatPerKWeight when fee estimation is in own
+	// package. Currently this will cause an import cycle.
 	FeePerKiloWeight uint32
 
 	// CsvDelay is the number of blocks to use for the relative time lock
@@ -91,6 +105,12 @@ type OpenChannel struct {
 	// where they claim funds.
 	DelayedPaymentPoint *btcec.PublicKey
 
+	// HtlcPoint is the base point used to derive the set of keys for this
+	// party that will be used within the HTLC public key scripts.  This
+	// value is combined with the receiver's revocation base point in order
+	// to derive the keys that are used within HTLC scripts.
+	HtlcPoint *btcec.PublicKey
+
 	// FirstCommitmentPoint is the first commitment point for the sending
 	// party. This value should be combined with the receiver's revocation
 	// base point in order to derive the revocation keys that are placed
@@ -101,7 +121,7 @@ type OpenChannel struct {
 	// channel to specify further behavior surrounding the channel.
 	// Currently, the least significant bit of this bit field indicates the
 	// initiator of the channel wishes to advertise this channel publicly.
-	ChannelFlags byte
+	ChannelFlags FundingFlag
 }
 
 // A compile time check to ensure OpenChannel implements the lnwire.Message
@@ -114,7 +134,7 @@ var _ Message = (*OpenChannel)(nil)
 //
 // This is part of the lnwire.Message interface.
 func (o *OpenChannel) Encode(w io.Writer, pver uint32) error {
-	return writeElements(w,
+	return WriteElements(w,
 		o.ChainHash[:],
 		o.PendingChannelID[:],
 		o.FundingAmount,
@@ -130,6 +150,7 @@ func (o *OpenChannel) Encode(w io.Writer, pver uint32) error {
 		o.RevocationPoint,
 		o.PaymentPoint,
 		o.DelayedPaymentPoint,
+		o.HtlcPoint,
 		o.FirstCommitmentPoint,
 		o.ChannelFlags,
 	)
@@ -141,7 +162,7 @@ func (o *OpenChannel) Encode(w io.Writer, pver uint32) error {
 //
 // This is part of the lnwire.Message interface.
 func (o *OpenChannel) Decode(r io.Reader, pver uint32) error {
-	return readElements(r,
+	return ReadElements(r,
 		o.ChainHash[:],
 		o.PendingChannelID[:],
 		&o.FundingAmount,
@@ -157,13 +178,14 @@ func (o *OpenChannel) Decode(r io.Reader, pver uint32) error {
 		&o.RevocationPoint,
 		&o.PaymentPoint,
 		&o.DelayedPaymentPoint,
+		&o.HtlcPoint,
 		&o.FirstCommitmentPoint,
 		&o.ChannelFlags,
 	)
 }
 
 // MsgType returns the MessageType code which uniquely identifies this message
-// as a OpenChannel on the wire.
+// as an OpenChannel on the wire.
 //
 // This is part of the lnwire.Message interface.
 func (o *OpenChannel) MsgType() MessageType {
@@ -175,6 +197,6 @@ func (o *OpenChannel) MsgType() MessageType {
 //
 // This is part of the lnwire.Message interface.
 func (o *OpenChannel) MaxPayloadLength(uint32) uint32 {
-	// (32 * 2) + (8 * 6) + (4 * 1) + (2 * 2) + (33 * 5) + 1
-	return 286
+	// (32 * 2) + (8 * 6) + (4 * 1) + (2 * 2) + (33 * 6) + 1
+	return 319
 }

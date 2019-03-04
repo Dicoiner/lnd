@@ -1,6 +1,9 @@
-package lnwire
-
+// Copyright (c) 2013-2017 The btcsuite developers
+// Copyright (c) 2015-2016 The Decred developers
 // code derived from https://github .com/btcsuite/btcd/blob/master/wire/message.go
+// Copyright (C) 2015-2017 The Lightning Network Developers
+
+package lnwire
 
 import (
 	"bytes"
@@ -16,7 +19,7 @@ const MaxMessagePayload = 65535 // 65KB
 // MessageType is the unique 2 byte big-endian integer that indicates the type
 // of message on the wire. All messages have a very simple header which
 // consists simply of 2-byte message type. We omit a length field, and checksum
-// as the Lighting Protocol is intended to be encapsulated within a
+// as the Lightning Protocol is intended to be encapsulated within a
 // confidential+authenticated cryptographic messaging protocol.
 type MessageType uint16
 
@@ -32,19 +35,25 @@ const (
 	MsgFundingCreated                      = 34
 	MsgFundingSigned                       = 35
 	MsgFundingLocked                       = 36
-	MsgShutdown                            = 39
-	MsgClosingSigned                       = 40
+	MsgShutdown                            = 38
+	MsgClosingSigned                       = 39
 	MsgUpdateAddHTLC                       = 128
-	MsgUpdateFufillHTLC                    = 130
+	MsgUpdateFulfillHTLC                   = 130
 	MsgUpdateFailHTLC                      = 131
 	MsgCommitSig                           = 132
 	MsgRevokeAndAck                        = 133
+	MsgUpdateFee                           = 134
 	MsgUpdateFailMalformedHTLC             = 135
-	MsgUpdateFee                           = 137
+	MsgChannelReestablish                  = 136
 	MsgChannelAnnouncement                 = 256
 	MsgNodeAnnouncement                    = 257
 	MsgChannelUpdate                       = 258
 	MsgAnnounceSignatures                  = 259
+	MsgQueryShortChanIDs                   = 261
+	MsgReplyShortChanIDsEnd                = 262
+	MsgQueryChannelRange                   = 263
+	MsgReplyChannelRange                   = 264
+	MsgGossipTimestampRange                = 265
 )
 
 // String return the string representation of message type.
@@ -70,14 +79,16 @@ func (t MessageType) String() string {
 		return "UpdateAddHTLC"
 	case MsgUpdateFailHTLC:
 		return "UpdateFailHTLC"
-	case MsgUpdateFufillHTLC:
-		return "UpdateFufillHTLC"
+	case MsgUpdateFulfillHTLC:
+		return "UpdateFulfillHTLC"
 	case MsgCommitSig:
 		return "CommitSig"
 	case MsgRevokeAndAck:
 		return "RevokeAndAck"
 	case MsgUpdateFailMalformedHTLC:
 		return "UpdateFailMalformedHTLC"
+	case MsgChannelReestablish:
+		return "ChannelReestablish"
 	case MsgError:
 		return "Error"
 	case MsgChannelAnnouncement:
@@ -94,6 +105,16 @@ func (t MessageType) String() string {
 		return "Pong"
 	case MsgUpdateFee:
 		return "UpdateFee"
+	case MsgQueryShortChanIDs:
+		return "QueryShortChanIDs"
+	case MsgReplyShortChanIDsEnd:
+		return "ReplyShortChanIDsEnd"
+	case MsgQueryChannelRange:
+		return "QueryChannelRange"
+	case MsgReplyChannelRange:
+		return "ReplyChannelRange"
+	case MsgGossipTimestampRange:
+		return "GossipTimestampRange"
 	default:
 		return "<unknown>"
 	}
@@ -159,8 +180,8 @@ func makeEmptyMessage(msgType MessageType) (Message, error) {
 		msg = &UpdateAddHTLC{}
 	case MsgUpdateFailHTLC:
 		msg = &UpdateFailHTLC{}
-	case MsgUpdateFufillHTLC:
-		msg = &UpdateFufillHTLC{}
+	case MsgUpdateFulfillHTLC:
+		msg = &UpdateFulfillHTLC{}
 	case MsgCommitSig:
 		msg = &CommitSig{}
 	case MsgRevokeAndAck:
@@ -169,6 +190,8 @@ func makeEmptyMessage(msgType MessageType) (Message, error) {
 		msg = &UpdateFee{}
 	case MsgUpdateFailMalformedHTLC:
 		msg = &UpdateFailMalformedHTLC{}
+	case MsgChannelReestablish:
+		msg = &ChannelReestablish{}
 	case MsgError:
 		msg = &Error{}
 	case MsgChannelAnnouncement:
@@ -183,8 +206,18 @@ func makeEmptyMessage(msgType MessageType) (Message, error) {
 		msg = &AnnounceSignatures{}
 	case MsgPong:
 		msg = &Pong{}
+	case MsgQueryShortChanIDs:
+		msg = &QueryShortChanIDs{}
+	case MsgReplyShortChanIDsEnd:
+		msg = &ReplyShortChanIDsEnd{}
+	case MsgQueryChannelRange:
+		msg = &QueryChannelRange{}
+	case MsgReplyChannelRange:
+		msg = &ReplyChannelRange{}
+	case MsgGossipTimestampRange:
+		msg = &GossipTimestampRange{}
 	default:
-		return nil, fmt.Errorf("unknown message type [%d]", msgType)
+		return nil, &UnknownMessage{msgType}
 	}
 
 	return msg, nil

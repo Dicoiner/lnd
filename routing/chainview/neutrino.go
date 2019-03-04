@@ -5,23 +5,23 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
+	"github.com/btcsuite/btcd/rpcclient"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btcutil"
+	"github.com/btcsuite/btcutil/gcs/builder"
 	"github.com/lightninglabs/neutrino"
-	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcd/rpcclient"
-	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcutil"
-	"github.com/roasbeef/btcutil/gcs/builder"
-	"github.com/roasbeef/btcwallet/waddrmgr"
+	"github.com/lightningnetwork/lnd/channeldb"
 )
 
 // CfFilteredChainView is an implementation of the FilteredChainView interface
 // which is supported by an underlying Bitcoin light client which supports
 // client side filtering of Golomb Coded Sets. Rather than fetching all the
-// blocks, the light client is able to query fitlers locally, to test if an
+// blocks, the light client is able to query filters locally, to test if an
 // item in a block modifies any of our watched set of UTXOs.
 type CfFilteredChainView struct {
-	started int32
-	stopped int32
+	started int32 // To be used atomically.
+	stopped int32 // To be used atomically.
 
 	// p2pNode is a pointer to the running GCS-filter supported Bitcoin
 	// light clientl
@@ -29,26 +29,20 @@ type CfFilteredChainView struct {
 
 	// chainView is the active rescan which only watches our specified
 	// sub-set of the UTXO set.
-	chainView neutrino.Rescan
+	chainView *neutrino.Rescan
 
 	// rescanErrChan is the channel that any errors encountered during the
 	// rescan will be sent over.
 	rescanErrChan <-chan error
 
-	// newBlocks is the channel in which new filtered blocks are sent over.
-	newBlocks chan *FilteredBlock
-
-	// staleBlocks is the channel in which blocks that have been
-	// disconnected from the mainchain are sent over.
-	staleBlocks chan *FilteredBlock
-
-	// filterUpdates is a channel in which updates to the utxo filter
-	// attached to this instance are sent over.
-	filterUpdates chan filterUpdate
+	// blockEventQueue is the ordered queue used to keep the order
+	// of connected and disconnected blocks sent to the reader of the
+	// chainView.
+	blockQueue *blockEventQueue
 
 	// chainFilter is the
 	filterMtx   sync.RWMutex
-	chainFilter map[wire.OutPoint]struct{}
+	chainFilter map[wire.OutPoint][]byte
 
 	quit chan struct{}
 	wg   sync.WaitGroup
@@ -61,16 +55,14 @@ var _ FilteredChainView = (*CfFilteredChainView)(nil)
 // NewCfFilteredChainView creates a new instance of the CfFilteredChainView
 // which is connected to an active neutrino node.
 //
-// NOTE: The node should already be running an syncing before being passed into
+// NOTE: The node should already be running and syncing before being passed into
 // this function.
 func NewCfFilteredChainView(node *neutrino.ChainService) (*CfFilteredChainView, error) {
 	return &CfFilteredChainView{
-		newBlocks:     make(chan *FilteredBlock),
-		staleBlocks:   make(chan *FilteredBlock),
+		blockQueue:    newBlockEventQueue(),
 		quit:          make(chan struct{}),
 		rescanErrChan: make(chan error),
-		filterUpdates: make(chan filterUpdate),
-		chainFilter:   make(map[wire.OutPoint]struct{}),
+		chainFilter:   make(map[wire.OutPoint][]byte),
 		p2pNode:       node,
 	}, nil
 }
@@ -91,20 +83,16 @@ func (c *CfFilteredChainView) Start() error {
 	// start the auto-rescan from this point. Once a caller actually wishes
 	// to register a chain view, the rescan state will be rewound
 	// accordingly.
-	bestHeader, bestHeight, err := c.p2pNode.BlockHeaders.ChainTip()
+	startingPoint, err := c.p2pNode.BestBlock()
 	if err != nil {
 		return err
 	}
-	startingPoint := &waddrmgr.BlockStamp{
-		Height: int32(bestHeight),
-		Hash:   bestHeader.BlockHash(),
-	}
 
 	// Next, we'll create our set of rescan options. Currently it's
-	// required that a user MUST set a addr/outpoint/txid when creating a
+	// required that an user MUST set a addr/outpoint/txid when creating a
 	// rescan. To get around this, we'll add a "zero" outpoint, that won't
 	// actually be matched.
-	var zeroPoint wire.OutPoint
+	var zeroPoint neutrino.InputWithScript
 	rescanOptions := []neutrino.RescanOption{
 		neutrino.StartBlock(startingPoint),
 		neutrino.QuitChan(c.quit),
@@ -114,13 +102,15 @@ func (c *CfFilteredChainView) Start() error {
 				OnFilteredBlockDisconnected: c.onFilteredBlockDisconnected,
 			},
 		),
-		neutrino.WatchOutPoints(zeroPoint),
+		neutrino.WatchInputs(zeroPoint),
 	}
 
 	// Finally, we'll create our rescan struct, start it, and launch all
 	// the goroutines we need to operate this FilteredChainView instance.
 	c.chainView = c.p2pNode.NewRescan(rescanOptions...)
 	c.rescanErrChan = c.chainView.Start()
+
+	c.blockQueue.Start()
 
 	c.wg.Add(1)
 	go c.chainFilterer()
@@ -140,6 +130,7 @@ func (c *CfFilteredChainView) Stop() error {
 	log.Infof("FilteredChainView stopping")
 
 	close(c.quit)
+	c.blockQueue.Stop()
 	c.wg.Wait()
 
 	return nil
@@ -164,13 +155,16 @@ func (c *CfFilteredChainView) onFilteredBlockConnected(height int32,
 
 	}
 
-	go func() {
-		c.newBlocks <- &FilteredBlock{
-			Hash:         header.BlockHash(),
-			Height:       uint32(height),
-			Transactions: mtxs,
-		}
-	}()
+	block := &FilteredBlock{
+		Hash:         header.BlockHash(),
+		Height:       uint32(height),
+		Transactions: mtxs,
+	}
+
+	c.blockQueue.Add(&blockEvent{
+		eventType: connected,
+		block:     block,
+	})
 }
 
 // onFilteredBlockDisconnected is a callback which is executed once a block is
@@ -178,59 +172,29 @@ func (c *CfFilteredChainView) onFilteredBlockConnected(height int32,
 func (c *CfFilteredChainView) onFilteredBlockDisconnected(height int32,
 	header *wire.BlockHeader) {
 
+	log.Debugf("got disconnected block at height %d: %v", height,
+		header.BlockHash())
+
 	filteredBlock := &FilteredBlock{
 		Hash:   header.BlockHash(),
 		Height: uint32(height),
 	}
 
-	go func() {
-		c.staleBlocks <- filteredBlock
-	}()
+	c.blockQueue.Add(&blockEvent{
+		eventType: disconnected,
+		block:     filteredBlock,
+	})
 }
 
 // chainFilterer is the primary coordination goroutine within the
-// CfFilteredChainView. This goroutine handles errors from the running rescan,
-// and also filter updates.
+// CfFilteredChainView. This goroutine handles errors from the running rescan.
 func (c *CfFilteredChainView) chainFilterer() {
 	defer c.wg.Done()
 
 	for {
 		select {
-
 		case err := <-c.rescanErrChan:
 			log.Errorf("Error encountered during rescan: %v", err)
-
-		// We've received a new update to the filter from the caller to
-		// mutate their established chain view.
-		case update := <-c.filterUpdates:
-			log.Debugf("Updating chain filter with new UTXO's: %v",
-				update.newUtxos)
-
-			// First, we'll update the current chain view, by
-			// adding any new UTXO's, ignoring duplicates int he
-			// process.
-			c.filterMtx.Lock()
-			for _, op := range update.newUtxos {
-				c.chainFilter[op] = struct{}{}
-			}
-			c.filterMtx.Unlock()
-
-			// With our internal chain view update, we'll craft a
-			// new update to the chainView which includes our new
-			// UTXO's, and current update height.
-			rescanUpdate := []neutrino.UpdateOption{
-				neutrino.AddOutPoints(update.newUtxos...),
-				neutrino.Rewind(update.updateHeight),
-			}
-			err := c.chainView.Update(rescanUpdate...)
-			if err != nil {
-				log.Errorf("unable to update rescan: %v", err)
-			}
-
-			if update.done != nil {
-				close(update.done)
-			}
-
 		case <-c.quit:
 			return
 		}
@@ -246,14 +210,14 @@ func (c *CfFilteredChainView) chainFilterer() {
 func (c *CfFilteredChainView) FilterBlock(blockHash *chainhash.Hash) (*FilteredBlock, error) {
 	// First, we'll fetch the block header itself so we can obtain the
 	// height which is part of our return value.
-	_, blockHeight, err := c.p2pNode.BlockHeaders.FetchHeader(blockHash)
+	blockHeight, err := c.p2pNode.GetBlockHeight(blockHash)
 	if err != nil {
 		return nil, err
 	}
 
 	filteredBlock := &FilteredBlock{
 		Hash:   *blockHash,
-		Height: blockHeight,
+		Height: uint32(blockHeight),
 	}
 
 	// If we don't have any items within our current chain filter, then we
@@ -268,9 +232,13 @@ func (c *CfFilteredChainView) FilterBlock(blockHash *chainhash.Hash) (*FilteredB
 	// Next, using the block, hash, we'll fetch the compact filter for this
 	// block. We only require the regular filter as we're just looking for
 	// outpoint that have been spent.
-	filter, err := c.p2pNode.GetCFilter(*blockHash, false)
+	filter, err := c.p2pNode.GetCFilter(*blockHash, wire.GCSFilterRegular)
 	if err != nil {
 		return nil, err
+	}
+
+	if filter == nil {
+		return nil, fmt.Errorf("Unable to fetch filter")
 	}
 
 	// Before we can match the filter, we'll need to map each item in our
@@ -278,9 +246,8 @@ func (c *CfFilteredChainView) FilterBlock(blockHash *chainhash.Hash) (*FilteredB
 	// filters.
 	c.filterMtx.RLock()
 	relevantPoints := make([][]byte, 0, len(c.chainFilter))
-	for op := range c.chainFilter {
-		opBytes := builder.OutPointToFilterEntry(op)
-		relevantPoints = append(relevantPoints, opBytes)
+	for _, filterEntry := range c.chainFilter {
+		relevantPoints = append(relevantPoints, filterEntry)
 	}
 	c.filterMtx.RUnlock()
 
@@ -301,7 +268,7 @@ func (c *CfFilteredChainView) FilterBlock(blockHash *chainhash.Hash) (*FilteredB
 	// If we reach this point, then there was a match, so we'll need to
 	// fetch the block itself so we can scan it for any actual matches (as
 	// there's a fp rate).
-	block, err := c.p2pNode.GetBlockFromNetwork(*blockHash)
+	block, err := c.p2pNode.GetBlock(*blockHash)
 	if err != nil {
 		return nil, err
 	}
@@ -343,27 +310,39 @@ func (c *CfFilteredChainView) FilterBlock(blockHash *chainhash.Hash) (*FilteredB
 // rewound to ensure all relevant notifications are dispatched.
 //
 // NOTE: This is part of the FilteredChainView interface.
-func (c *CfFilteredChainView) UpdateFilter(ops []wire.OutPoint, updateHeight uint32) error {
-	doneChan := make(chan struct{})
-	update := filterUpdate{
-		newUtxos:     ops,
-		updateHeight: updateHeight,
-		done:         doneChan,
+func (c *CfFilteredChainView) UpdateFilter(ops []channeldb.EdgePoint,
+	updateHeight uint32) error {
+
+	log.Tracef("Updating chain filter with new UTXO's: %v", ops)
+
+	// First, we'll update the current chain view, by adding any new
+	// UTXO's, ignoring duplicates in the process.
+	c.filterMtx.Lock()
+	for _, op := range ops {
+		c.chainFilter[op.OutPoint] = op.FundingPkScript
+	}
+	c.filterMtx.Unlock()
+
+	inputs := make([]neutrino.InputWithScript, len(ops))
+	for i, op := range ops {
+		inputs[i] = neutrino.InputWithScript{
+			PkScript: op.FundingPkScript,
+			OutPoint: op.OutPoint,
+		}
 	}
 
-	select {
-	case c.filterUpdates <- update:
-	case <-c.quit:
-		return fmt.Errorf("chain filter shutting down")
+	// With our internal chain view update, we'll craft a new update to the
+	// chainView which includes our new UTXO's, and current update height.
+	rescanUpdate := []neutrino.UpdateOption{
+		neutrino.AddInputs(inputs...),
+		neutrino.Rewind(updateHeight),
+		neutrino.DisableDisconnectedNtfns(true),
 	}
-
-	select {
-	case <-doneChan:
-		return nil
-	case <-c.quit:
-		return fmt.Errorf("chain filter shutting down")
+	err := c.chainView.Update(rescanUpdate...)
+	if err != nil {
+		return fmt.Errorf("unable to update rescan: %v", err)
 	}
-
+	return nil
 }
 
 // FilteredBlocks returns the channel that filtered blocks are to be sent over.
@@ -373,7 +352,7 @@ func (c *CfFilteredChainView) UpdateFilter(ops []wire.OutPoint, updateHeight uin
 //
 // NOTE: This is part of the FilteredChainView interface.
 func (c *CfFilteredChainView) FilteredBlocks() <-chan *FilteredBlock {
-	return c.newBlocks
+	return c.blockQueue.newBlocks
 }
 
 // DisconnectedBlocks returns a receive only channel which will be sent upon
@@ -382,5 +361,5 @@ func (c *CfFilteredChainView) FilteredBlocks() <-chan *FilteredBlock {
 //
 // NOTE: This is part of the FilteredChainView interface.
 func (c *CfFilteredChainView) DisconnectedBlocks() <-chan *FilteredBlock {
-	return c.staleBlocks
+	return c.blockQueue.staleBlocks
 }

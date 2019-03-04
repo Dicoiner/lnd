@@ -2,7 +2,6 @@ package channeldb
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -31,13 +30,22 @@ func makeFakePayment() *OutgoingPayment {
 		copy(fakePath[i][:], bytes.Repeat([]byte{byte(i)}, 33))
 	}
 
-	return &OutgoingPayment{
+	fakePayment := &OutgoingPayment{
 		Invoice:        *fakeInvoice,
 		Fee:            101,
 		Path:           fakePath,
 		TimeLockLength: 1000,
-		PaymentHash:    sha256.Sum256(rev[:]),
 	}
+	copy(fakePayment.PaymentPreimage[:], rev[:])
+	return fakePayment
+}
+
+func makeFakePaymentHash() [32]byte {
+	var paymentHash [32]byte
+	rBytes, _ := randomBytes(0, 32)
+	copy(paymentHash[:], rBytes)
+
+	return paymentHash
 }
 
 // randomBytes creates random []byte with length in range [minLen, maxLen)
@@ -90,14 +98,13 @@ func makeRandomFakePayment() (*OutgoingPayment, error) {
 		copy(fakePath[i][:], b)
 	}
 
-	rHash := sha256.Sum256(fakeInvoice.Terms.PaymentPreimage[:])
 	fakePayment := &OutgoingPayment{
 		Invoice:        *fakeInvoice,
 		Fee:            lnwire.MilliSatoshi(rand.Intn(1001)),
 		Path:           fakePath,
 		TimeLockLength: uint32(rand.Intn(10000)),
-		PaymentHash:    rHash,
 	}
+	copy(fakePayment.PaymentPreimage[:], fakeInvoice.Terms.PaymentPreimage[:])
 
 	return fakePayment, nil
 }
@@ -194,5 +201,53 @@ func TestOutgoingPaymentWorkflow(t *testing.T) {
 	if len(paymentsAfterDeletion) != 0 {
 		t.Fatalf("After deletion DB has %v payments, want %v",
 			len(paymentsAfterDeletion), 0)
+	}
+}
+
+func TestPaymentStatusWorkflow(t *testing.T) {
+	t.Parallel()
+
+	db, cleanUp, err := makeTestDB()
+	defer cleanUp()
+	if err != nil {
+		t.Fatalf("unable to make test db: %v", err)
+	}
+
+	testCases := []struct {
+		paymentHash [32]byte
+		status      PaymentStatus
+	}{
+		{
+			paymentHash: makeFakePaymentHash(),
+			status:      StatusGrounded,
+		},
+		{
+			paymentHash: makeFakePaymentHash(),
+			status:      StatusInFlight,
+		},
+		{
+			paymentHash: makeFakePaymentHash(),
+			status:      StatusCompleted,
+		},
+	}
+
+	for _, testCase := range testCases {
+		err := db.UpdatePaymentStatus(testCase.paymentHash, testCase.status)
+		if err != nil {
+			t.Fatalf("unable to put payment in DB: %v", err)
+		}
+
+		status, err := db.FetchPaymentStatus(testCase.paymentHash)
+		if err != nil {
+			t.Fatalf("unable to fetch payments from DB: %v", err)
+		}
+
+		if status != testCase.status {
+			t.Fatalf("Wrong payments status after reading from DB."+
+				"Got %v, want %v",
+				spew.Sdump(status),
+				spew.Sdump(testCase.status),
+			)
+		}
 	}
 }

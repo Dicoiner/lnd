@@ -25,15 +25,25 @@ _testmain.go
 *.prof
 
 /lnd
+/lnd-debug
+/lncli
+/lncli-debug
+/lnd-itest
+/lncli-itest
+
+# Integration test log files
+output*.log
+/.backendlogs
+/.minerlogs
 
 cmd/cmd
-**.key
-**.hex
+*.key
+*.hex
 
 cmd/lncli/lncli
 
 # vim
-**.swp
+*.swp
 
 *.hex
 *.db
@@ -41,7 +51,10 @@ cmd/lncli/lncli
 
 vendor
 *.idea
+*.iml
 profile.cov
 profile.tmp
 
 .DS_Store
+
+.vscode

@@ -7,6 +7,10 @@ var (
 	// created.
 	ErrNoChanDBExists = fmt.Errorf("channel db has not yet been created")
 
+	// ErrDBReversion is returned when detecting an attempt to revert to a
+	// prior database version.
+	ErrDBReversion = fmt.Errorf("channel db cannot revert to prior version")
+
 	// ErrLinkNodesNotFound is returned when node info bucket hasn't been
 	// created.
 	ErrLinkNodesNotFound = fmt.Errorf("no link nodes exist")
@@ -38,6 +42,10 @@ var (
 	// ErrNodeNotFound is returned when node bucket exists, but node with
 	// specific identity can't be found.
 	ErrNodeNotFound = fmt.Errorf("link node with target identity not found")
+
+	// ErrChannelNotFound is returned when we attempt to locate a channel
+	// for a specific chain, but it is not found.
+	ErrChannelNotFound = fmt.Errorf("channel not found")
 
 	// ErrMetaNotFound is returned when meta bucket hasn't been
 	// created.
@@ -85,4 +93,29 @@ var (
 	// ErrNoClosedChannels is returned when a node is queries for all the
 	// channels it has closed, but it hasn't yet closed any channels.
 	ErrNoClosedChannels = fmt.Errorf("no channel have been closed yet")
+
+	// ErrNoForwardingEvents is returned in the case that a query fails due
+	// to the log not having any recorded events.
+	ErrNoForwardingEvents = fmt.Errorf("no recorded forwarding events")
+
+	// ErrEdgePolicyOptionalFieldNotFound is an error returned if a channel
+	// policy field is not found in the db even though its message flags
+	// indicate it should be.
+	ErrEdgePolicyOptionalFieldNotFound = fmt.Errorf("optional field not " +
+		"present")
+
+	// ErrChanAlreadyExists is return when the caller attempts to create a
+	// channel with a channel point that is already present in the
+	// database.
+	ErrChanAlreadyExists = fmt.Errorf("channel already exists")
 )
+
+// ErrTooManyExtraOpaqueBytes creates an error which should be returned if the
+// caller attempts to write an announcement message which bares too many extra
+// opaque bytes. We limit this value in order to ensure that we don't waste
+// disk space due to nodes unnecessarily padding out their announcements with
+// garbage data.
+func ErrTooManyExtraOpaqueBytes(numBytes int) error {
+	return fmt.Errorf("max allowed number of opaque bytes is %v, received "+
+		"%v bytes", MaxAllowedExtraOpaqueBytes, numBytes)
+}
